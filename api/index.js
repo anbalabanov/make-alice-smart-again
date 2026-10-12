@@ -140,6 +140,12 @@ function extractUserText(body) {
   return utterance;
 }
 
+function isAlicePing(body) {
+  const command = String(body?.request?.command || "").trim().toLowerCase();
+  const utterance = String(body?.request?.original_utterance || "").trim().toLowerCase();
+  return command === "ping" || utterance === "ping";
+}
+
 function safeHistory(history) {
   if (!Array.isArray(history)) return [];
   return history
@@ -374,8 +380,15 @@ export default async function handler(req, res) {
     const startedAt = Date.now();
     const remainingMs = () => TOTAL_RESPONSE_BUDGET_MS - (Date.now() - startedAt);
     const body = parseRequestBody(req);
-    const text = extractUserText(body);
     const oldHistory = safeHistory(body?.state?.session?.history);
+
+    // Dialogs health-check: original_utterance/command == "ping"
+    if (isAlicePing(body)) {
+      console.log("Alice request: ping");
+      return res.status(200).json(aliceResponse("pong", false, oldHistory, body));
+    }
+
+    const text = extractUserText(body);
     const requestSummary = summarizeRequest(body, text);
     console.log("Alice request:", JSON.stringify(requestSummary));
 
