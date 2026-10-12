@@ -111,6 +111,24 @@ function isSearchIntent(text) {
   return /\b(latest|today|current|news|weather|price|exchange rate|recent|search|look up)\b|сегодня|сейчас|последн|новост|погод|курс валют|найди|поищи|актуальн|сколько стоит|свежие данные/i.test(text);
 }
 
+function isLaunchUtterance(text) {
+  return /^(алиса[,!]?\s*)?(запусти|открой|включи|стартани)\s+(навык\s+)?/i.test(String(text || "").trim());
+}
+
+function extractUserText(body) {
+  // `command` is the user phrase without skill activation words. Prefer it.
+  const command = String(body?.request?.command || "").trim();
+  if (command) return command;
+
+  const utterance = String(body?.request?.original_utterance || "").trim();
+  if (!utterance) return "";
+
+  // On skill open Alice often sends only a launch phrase in original_utterance.
+  // Calling an LLM here causes timeouts and "Ошибка сервера" in the tester.
+  if (body?.session?.new || isLaunchUtterance(utterance)) return "";
+  return utterance;
+}
+
 function safeHistory(history) {
   if (!Array.isArray(history)) return [];
   return history
@@ -345,7 +363,7 @@ export default async function handler(req, res) {
     const startedAt = Date.now();
     const remainingMs = () => TOTAL_RESPONSE_BUDGET_MS - (Date.now() - startedAt);
     const body = parseRequestBody(req);
-    const text = String(body?.request?.command || body?.request?.original_utterance || "").trim();
+    const text = extractUserText(body);
     const oldHistory = safeHistory(body?.state?.session?.history);
 
     if (!text) {
@@ -397,7 +415,9 @@ export default async function handler(req, res) {
 
 export {
   aliceResponse,
+  extractUserText,
   fitAliceText,
+  isLaunchUtterance,
   isSearchIntent,
   parseRequestBody,
   resolveProvider,

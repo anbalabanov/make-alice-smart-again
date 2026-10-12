@@ -1,6 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { aliceResponse, fitAliceText, isSearchIntent, resolveProvider, safeHistory } from "../api/index.js";
+import {
+  aliceResponse,
+  extractUserText,
+  fitAliceText,
+  isLaunchUtterance,
+  isSearchIntent,
+  resolveProvider,
+  safeHistory
+} from "../api/index.js";
 
 test("Alice response uses required response envelope", () => {
   const result = aliceResponse(
@@ -20,6 +28,26 @@ test("search intent detects Russian and English freshness requests", () => {
   assert.equal(isSearchIntent("Какая погода сегодня?"), true);
   assert.equal(isSearchIntent("What is the latest news?"), true);
   assert.equal(isSearchIntent("Расскажи сказку"), false);
+});
+
+test("launch utterances are ignored so skill open does not call the LLM", () => {
+  assert.equal(isLaunchUtterance("запусти навык умный помощник"), true);
+  assert.equal(isLaunchUtterance("Алиса, открой навык тест"), true);
+  assert.equal(isLaunchUtterance("какая погода"), false);
+  assert.equal(
+    extractUserText({
+      session: { new: true },
+      request: { command: "", original_utterance: "запусти навык тест" }
+    }),
+    ""
+  );
+  assert.equal(
+    extractUserText({
+      session: { new: false },
+      request: { command: "привет", original_utterance: "привет" }
+    }),
+    "привет"
+  );
 });
 
 test("long responses are cut at a natural boundary and stay within Alice limit", () => {
