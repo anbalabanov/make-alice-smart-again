@@ -3,11 +3,17 @@ import assert from "node:assert/strict";
 import { aliceResponse, fitAliceText, isSearchIntent, resolveProvider, safeHistory } from "../api/index.js";
 
 test("Alice response uses required response envelope", () => {
-  const result = aliceResponse("Привет", false, [{ role: "user", text: "тест" }]);
+  const result = aliceResponse(
+    "Привет",
+    false,
+    [{ role: "user", text: "тест" }],
+    { version: "1.0", session: { session_id: "abc", message_id: 0, user_id: "u1" } }
+  );
   assert.equal(result.version, "1.0");
   assert.equal(result.response.text, "Привет");
   assert.equal(result.response.end_session, false);
   assert.deepEqual(result.session_state.history, [{ role: "user", text: "тест" }]);
+  assert.equal(result.session.session_id, "abc");
 });
 
 test("search intent detects Russian and English freshness requests", () => {

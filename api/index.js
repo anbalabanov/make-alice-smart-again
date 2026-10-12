@@ -55,15 +55,35 @@ function resolveApiKey(provider) {
   return key;
 }
 
-function aliceResponse(text, endSession = false, history = []) {
-  return {
-    version: "1.0",
+function aliceResponse(text, endSession = false, history = [], requestBody = {}) {
+  const payload = {
+    version: String(requestBody?.version || "1.0"),
     response: {
       text: fitAliceText(text),
       end_session: endSession
     },
     session_state: { history }
   };
+  // Older Alice clients still expect session echoed from the request.
+  if (requestBody?.session && typeof requestBody.session === "object") {
+    payload.session = requestBody.session;
+  }
+  return payload;
+}
+
+function parseRequestBody(req) {
+  const raw = req?.body;
+  if (!raw) return {};
+  if (typeof raw === "string") {
+    try {
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === "object" ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+  if (typeof raw === "object") return raw;
+  return {};
 }
 
 function fitAliceText(value) {
@@ -299,67 +319,77 @@ function errorForUser(error) {
 }
 
 export default async function handler(req, res) {
-  if (req.method === "GET") {
-    let provider = "gemini";
-    try {
-      provider = resolveProvider();
-    } catch {
-      provider = "invalid";
-    }
-    return res.status(200).json({
-      ok: true,
-      service: "alice-llm-serper",
-      provider,
-      message: "Webhook is ready. Yandex Dialogs should send POST requests to /api."
-    });
-  }
-
-  if (req.method !== "POST") {
-    res.setHeader("Allow", "GET, POST");
-    return res.status(405).json({ error: "Method not allowed" });
-  }
-
-  const startedAt = Date.now();
-  const remainingMs = () => TOTAL_RESPONSE_BUDGET_MS - (Date.now() - startedAt);
-  const body = req.body && typeof req.body === "object" ? req.body : {};
-  const text = String(body?.request?.command || body?.request?.original_utterance || "").trim();
-  const oldHistory = safeHistory(body?.state?.session?.history);
-
-  if (!text) {
-    return res.status(200).json(aliceResponse(
-      "Привет! Я могу ответить на вопрос или найти актуальную информацию. Что хочешь узнать?",
-      false,
-      oldHistory
-    ));
-  }
-
   try {
-    let searchContext = "";
-    if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
-      // Search has a very short budget because Alice expects a response within 4.5 seconds.
-      searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)));
+    if (req.method === "GET") {
+      let provider = "gemini";
+      try {
+        provider = resolveProvider();
+      } catch {
+        provider = "invalid";
+      }
+      return res.status(200).json({
+        ok: true,
+        service: "alice-llm-serper",
+        provider,
+        message: "Webhook is ready. Yandex Dialogs should send POST requests to /api."
+      });
     }
 
-    const answer = await askLlm(
-      text,
-      oldHistory,
-      searchContext,
-      Math.max(0, Math.min(LLM_TIMEOUT_MS, remainingMs() - 600))
-    );
+    if (req.method !== "POST") {
+      res.setHeader("Allow", "GET, POST");
+      return res.status(405).json({ error: "Method not allowed" });
+    }
 
-    const history = [
-      ...oldHistory,
-      { role: "user", text: text.slice(0, MAX_HISTORY_MESSAGE_CHARS) },
-      { role: "model", text: answer.slice(0, MAX_HISTORY_MESSAGE_CHARS) }
-    ].slice(-MAX_HISTORY_MESSAGES);
+    const startedAt = Date.now();
+    const remainingMs = () => TOTAL_RESPONSE_BUDGET_MS - (Date.now() - startedAt);
+    const body = parseRequestBody(req);
+    const text = String(body?.request?.command || body?.request?.original_utterance || "").trim();
+    const oldHistory = safeHistory(body?.state?.session?.history);
 
-    return res.status(200).json(aliceResponse(answer, false, history));
+    if (!text) {
+      return res.status(200).json(aliceResponse(
+        "Привет! Я могу ответить на вопрос или найти актуальную информацию. Что хочешь узнать?",
+        false,
+        oldHistory,
+        body
+      ));
+    }
+
+    try {
+      let searchContext = "";
+      if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
+        // Search has a very short budget because Alice expects a response within 4.5 seconds.
+        searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)));
+      }
+
+      const answer = await askLlm(
+        text,
+        oldHistory,
+        searchContext,
+        Math.max(0, Math.min(LLM_TIMEOUT_MS, remainingMs() - 600))
+      );
+
+      const history = [
+        ...oldHistory,
+        { role: "user", text: text.slice(0, MAX_HISTORY_MESSAGE_CHARS) },
+        { role: "model", text: answer.slice(0, MAX_HISTORY_MESSAGE_CHARS) }
+      ].slice(-MAX_HISTORY_MESSAGES);
+
+      return res.status(200).json(aliceResponse(answer, false, history, body));
+    } catch (error) {
+      const safeError = error?.message === "AbortError" || error?.name === "AbortError"
+        ? { message: "TIME_BUDGET_EXHAUSTED" }
+        : error;
+      console.warn("Alice webhook returned a fallback response:", safeError?.message || "unknown error");
+      return res.status(200).json(aliceResponse(errorForUser(safeError), false, oldHistory, body));
+    }
   } catch (error) {
-    const safeError = error?.message === "AbortError" || error?.name === "AbortError"
-      ? { message: "TIME_BUDGET_EXHAUSTED" }
-      : error;
-    console.warn("Alice webhook returned a fallback response:", safeError?.message || "unknown error");
-    return res.status(200).json(aliceResponse(errorForUser(safeError), false, oldHistory));
+    console.error("Alice webhook crashed:", error?.message || error);
+    return res.status(200).json(aliceResponse(
+      "Не получилось обработать запрос. Попробуйте ещё раз чуть позже.",
+      false,
+      []
+    ));
   }
 }
 
@@ -367,6 +397,7 @@ export {
   aliceResponse,
   fitAliceText,
   isSearchIntent,
+  parseRequestBody,
   resolveProvider,
   safeHistory
 };
