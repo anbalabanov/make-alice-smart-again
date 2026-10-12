@@ -21,9 +21,10 @@ const PROVIDERS = {
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
-const TOTAL_RESPONSE_BUDGET_MS = 3600;
-const SERPER_TIMEOUT_MS = 600;
-const LLM_TIMEOUT_MS = 2500;
+// Alice allows ~4.5s end-to-end; keep a small safety margin for network + JSON.
+const TOTAL_RESPONSE_BUDGET_MS = 4200;
+const SERPER_TIMEOUT_MS = 500;
+const LLM_TIMEOUT_MS = 3500;
 
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
@@ -266,7 +267,8 @@ async function askOpenAiCompatible(provider, text, history, searchContext, timeo
   );
 
   if (!response.ok) {
-    console.error(`${provider} request failed with HTTP`, response.status);
+    const apiMessage = data?.error?.message || data?.error?.code || "";
+    console.error(`${provider} request failed with HTTP`, response.status, apiMessage);
     mapHttpError(Number(response.status));
   }
 
