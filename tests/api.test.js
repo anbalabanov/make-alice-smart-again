@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { aliceResponse, fitAliceText, isSearchIntent, safeHistory } from "../api/index.js";
+import { aliceResponse, fitAliceText, isSearchIntent, resolveProvider, safeHistory } from "../api/index.js";
 
 test("Alice response uses required response envelope", () => {
   const result = aliceResponse("Привет", false, [{ role: "user", text: "тест" }]);
@@ -31,6 +31,23 @@ test("history filters malformed messages and keeps last 8", () => {
   assert.equal(result[7].text, "11");
 });
 
+test("resolveProvider defaults to gemini and accepts openai/deepseek", () => {
+  const previous = process.env.LLM_PROVIDER;
+  try {
+    delete process.env.LLM_PROVIDER;
+    assert.equal(resolveProvider(), "gemini");
+    process.env.LLM_PROVIDER = "OpenAI";
+    assert.equal(resolveProvider(), "openai");
+    process.env.LLM_PROVIDER = "deepseek";
+    assert.equal(resolveProvider(), "deepseek");
+    process.env.LLM_PROVIDER = "claude";
+    assert.throws(() => resolveProvider(), /INVALID_LLM_PROVIDER/);
+  } finally {
+    if (previous === undefined) delete process.env.LLM_PROVIDER;
+    else process.env.LLM_PROVIDER = previous;
+  }
+});
+
 test("GET health check returns an ok response", async () => {
   const handler = (await import("../api/index.js")).default;
   let statusCode = 200;
@@ -43,7 +60,8 @@ test("GET health check returns an ok response", async () => {
   await handler({ method: "GET" }, res);
   assert.equal(statusCode, 200);
   assert.equal(payload.ok, true);
-  assert.equal(payload.service, "alice-gemini-serper");
+  assert.equal(payload.service, "alice-llm-serper");
+  assert.equal(payload.provider, "gemini");
 });
 
 test("launch request returns a valid Alice greeting without external API keys", async () => {

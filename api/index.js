@@ -1,10 +1,29 @@
-const DEFAULT_MODEL = "gemini-3.5-flash-lite";
+const PROVIDERS = {
+  gemini: {
+    defaultModel: "gemini-3.5-flash-lite",
+    envKey: "GEMINI_API_KEY",
+    envModel: "GEMINI_MODEL"
+  },
+  openai: {
+    defaultModel: "gpt-4o-mini",
+    envKey: "OPENAI_API_KEY",
+    envModel: "OPENAI_MODEL",
+    baseUrl: "https://api.openai.com/v1"
+  },
+  deepseek: {
+    defaultModel: "deepseek-chat",
+    envKey: "DEEPSEEK_API_KEY",
+    envModel: "DEEPSEEK_MODEL",
+    baseUrl: "https://api.deepseek.com"
+  }
+};
+
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
 const TOTAL_RESPONSE_BUDGET_MS = 3600;
 const SERPER_TIMEOUT_MS = 600;
-const GEMINI_TIMEOUT_MS = 2500;
+const LLM_TIMEOUT_MS = 2500;
 
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
@@ -13,6 +32,28 @@ const SYSTEM_PROMPT = [
   "Если вопрос требует актуальных данных и переданы результаты поиска, опирайся на них; не выдумывай отсутствующие факты.",
   "Если не знаешь ответа, честно скажи об этом."
 ].join(" ");
+
+function resolveProvider() {
+  const raw = String(process.env.LLM_PROVIDER || "gemini").trim().toLowerCase();
+  if (!Object.prototype.hasOwnProperty.call(PROVIDERS, raw)) {
+    throw new Error("INVALID_LLM_PROVIDER");
+  }
+  return raw;
+}
+
+function resolveModel(provider) {
+  const config = PROVIDERS[provider];
+  const model = String(process.env[config.envModel] || process.env.LLM_MODEL || config.defaultModel).trim();
+  if (!/^[A-Za-z0-9._/-]+$/.test(model)) throw new Error("INVALID_MODEL_NAME");
+  return model;
+}
+
+function resolveApiKey(provider) {
+  const config = PROVIDERS[provider];
+  const key = process.env[config.envKey] || process.env.LLM_API_KEY;
+  if (!key) throw new Error("MISSING_LLM_KEY");
+  return key;
+}
 
 function aliceResponse(text, endSession = false, history = []) {
   return {
@@ -55,6 +96,12 @@ function safeHistory(history) {
     .filter(item => item && (item.role === "user" || item.role === "model") && typeof item.text === "string")
     .slice(-MAX_HISTORY_MESSAGES)
     .map(item => ({ role: item.role, text: item.text.slice(0, MAX_HISTORY_MESSAGE_CHARS) }));
+}
+
+function buildUserPrompt(text, searchContext) {
+  return searchContext
+    ? `${text}\n\nРезультаты поиска в интернете:\n${searchContext}\nИспользуй их только там, где они относятся к вопросу.`
+    : text;
 }
 
 async function fetchJson(url, options, timeoutMs) {
@@ -110,23 +157,20 @@ async function searchWeb(query, timeoutMs) {
   }
 }
 
+function mapHttpError(status) {
+  if (status === 401 || status === 403) throw new Error("LLM_KEY_REJECTED");
+  if (status === 429) throw new Error("LLM_QUOTA");
+  throw new Error("LLM_REQUEST_FAILED");
+}
+
 async function askGemini(text, history, searchContext, timeoutMs) {
-  const key = process.env.GEMINI_API_KEY;
-  if (!key) throw new Error("MISSING_GEMINI_KEY");
-  if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
-
-  const model = String(process.env.GEMINI_MODEL || DEFAULT_MODEL).trim();
-  if (!/^[A-Za-z0-9._-]+$/.test(model)) throw new Error("INVALID_MODEL_NAME");
-
+  const key = resolveApiKey("gemini");
+  const model = resolveModel("gemini");
   const contents = safeHistory(history).map(item => ({
     role: item.role,
     parts: [{ text: item.text }]
   }));
-
-  const prompt = searchContext
-    ? `${text}\n\nРезультаты поиска в интернете:\n${searchContext}\nИспользуй их только там, где они относятся к вопросу.`
-    : text;
-  contents.push({ role: "user", parts: [{ text: prompt }] });
+  contents.push({ role: "user", parts: [{ text: buildUserPrompt(text, searchContext) }] });
 
   const { response, data } = await fetchJson(
     `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
@@ -145,15 +189,12 @@ async function askGemini(text, history, searchContext, timeoutMs) {
         }
       })
     },
-    Math.min(GEMINI_TIMEOUT_MS, timeoutMs)
+    timeoutMs
   );
 
   if (!response.ok) {
-    const status = Number(response.status);
-    console.error("Gemini request failed with HTTP", status);
-    if (status === 401 || status === 403) throw new Error("GEMINI_KEY_REJECTED");
-    if (status === 429) throw new Error("GEMINI_QUOTA");
-    throw new Error("GEMINI_REQUEST_FAILED");
+    console.error("Gemini request failed with HTTP", response.status);
+    mapHttpError(Number(response.status));
   }
 
   const candidate = data?.candidates?.[0];
@@ -163,8 +204,8 @@ async function askGemini(text, history, searchContext, timeoutMs) {
     .trim();
 
   if (!answer) {
-    if (data?.promptFeedback?.blockReason) throw new Error("GEMINI_BLOCKED");
-    throw new Error("GEMINI_EMPTY_RESPONSE");
+    if (data?.promptFeedback?.blockReason) throw new Error("LLM_BLOCKED");
+    throw new Error("LLM_EMPTY_RESPONSE");
   }
   if (candidate?.finishReason === "MAX_TOKENS") {
     console.warn("Gemini reached the output token limit.");
@@ -172,15 +213,82 @@ async function askGemini(text, history, searchContext, timeoutMs) {
   return answer;
 }
 
+async function askOpenAiCompatible(provider, text, history, searchContext, timeoutMs) {
+  const config = PROVIDERS[provider];
+  const key = resolveApiKey(provider);
+  const model = resolveModel(provider);
+
+  const messages = [
+    { role: "system", content: SYSTEM_PROMPT },
+    ...safeHistory(history).map(item => ({
+      role: item.role === "model" ? "assistant" : "user",
+      content: item.text
+    })),
+    { role: "user", content: buildUserPrompt(text, searchContext) }
+  ];
+
+  const { response, data } = await fetchJson(
+    `${config.baseUrl}/chat/completions`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${key}`
+      },
+      body: JSON.stringify({
+        model,
+        messages,
+        temperature: 0.5,
+        max_tokens: 240
+      })
+    },
+    timeoutMs
+  );
+
+  if (!response.ok) {
+    console.error(`${provider} request failed with HTTP`, response.status);
+    mapHttpError(Number(response.status));
+  }
+
+  const choice = data?.choices?.[0];
+  const answer = String(choice?.message?.content || "").trim();
+  if (!answer) {
+    if (data?.error?.code === "content_filter" || choice?.finish_reason === "content_filter") {
+      throw new Error("LLM_BLOCKED");
+    }
+    throw new Error("LLM_EMPTY_RESPONSE");
+  }
+  if (choice?.finish_reason === "length") {
+    console.warn(`${provider} reached the output token limit.`);
+  }
+  return answer;
+}
+
+async function askLlm(text, history, searchContext, timeoutMs) {
+  if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
+
+  const provider = resolveProvider();
+  const budget = Math.min(LLM_TIMEOUT_MS, timeoutMs);
+
+  if (provider === "gemini") {
+    return askGemini(text, history, searchContext, budget);
+  }
+  return askOpenAiCompatible(provider, text, history, searchContext, budget);
+}
+
 function errorForUser(error) {
   switch (error?.message) {
-    case "MISSING_GEMINI_KEY":
-      return "Сервер пока не настроен. Проверьте переменную GEMINI_API_KEY в настройках Vercel.";
-    case "GEMINI_KEY_REJECTED":
-      return "Не удалось подключиться к Gemini. Проверьте API-ключ в настройках Vercel.";
-    case "GEMINI_QUOTA":
-      return "Сейчас превышен лимит запросов к Gemini. Попробуйте немного позже.";
-    case "GEMINI_BLOCKED":
+    case "INVALID_LLM_PROVIDER":
+      return "Сервер пока не настроен. Укажите LLM_PROVIDER=gemini, openai или deepseek.";
+    case "MISSING_LLM_KEY":
+      return "Сервер пока не настроен. Проверьте API-ключ выбранного провайдера в настройках Vercel.";
+    case "INVALID_MODEL_NAME":
+      return "Сервер пока не настроен. Проверьте имя модели в переменных окружения.";
+    case "LLM_KEY_REJECTED":
+      return "Не удалось подключиться к нейросети. Проверьте API-ключ в настройках Vercel.";
+    case "LLM_QUOTA":
+      return "Сейчас превышен лимит запросов к нейросети. Попробуйте немного позже.";
+    case "LLM_BLOCKED":
       return "Я не смогла обработать этот запрос. Попробуйте спросить иначе.";
     case "TIME_BUDGET_EXHAUSTED":
     case "AbortError":
@@ -192,9 +300,16 @@ function errorForUser(error) {
 
 export default async function handler(req, res) {
   if (req.method === "GET") {
+    let provider = "gemini";
+    try {
+      provider = resolveProvider();
+    } catch {
+      provider = "invalid";
+    }
     return res.status(200).json({
       ok: true,
-      service: "alice-gemini-serper",
+      service: "alice-llm-serper",
+      provider,
       message: "Webhook is ready. Yandex Dialogs should send POST requests to /api."
     });
   }
@@ -225,11 +340,11 @@ export default async function handler(req, res) {
       searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)));
     }
 
-    const answer = await askGemini(
+    const answer = await askLlm(
       text,
       oldHistory,
       searchContext,
-      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 600))
+      Math.max(0, Math.min(LLM_TIMEOUT_MS, remainingMs() - 600))
     );
 
     const history = [
@@ -240,10 +355,18 @@ export default async function handler(req, res) {
 
     return res.status(200).json(aliceResponse(answer, false, history));
   } catch (error) {
-    const safeError = error?.message === "AbortError" ? "TIME_BUDGET_EXHAUSTED" : error;
+    const safeError = error?.message === "AbortError" || error?.name === "AbortError"
+      ? { message: "TIME_BUDGET_EXHAUSTED" }
+      : error;
     console.warn("Alice webhook returned a fallback response:", safeError?.message || "unknown error");
     return res.status(200).json(aliceResponse(errorForUser(safeError), false, oldHistory));
   }
 }
 
-export { aliceResponse, fitAliceText, isSearchIntent, safeHistory };
+export {
+  aliceResponse,
+  fitAliceText,
+  isSearchIntent,
+  resolveProvider,
+  safeHistory
+};
