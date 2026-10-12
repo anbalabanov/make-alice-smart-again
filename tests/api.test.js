@@ -19,9 +19,10 @@ test("Alice response uses required response envelope", () => {
   );
   assert.equal(result.version, "1.0");
   assert.equal(result.response.text, "Привет");
+  assert.equal(result.response.tts, "Привет");
   assert.equal(result.response.end_session, false);
   assert.deepEqual(result.session_state.history, [{ role: "user", text: "тест" }]);
-  assert.equal(result.session.session_id, "abc");
+  assert.equal(result.session, undefined);
 });
 
 test("search intent detects Russian and English freshness requests", () => {

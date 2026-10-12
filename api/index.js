@@ -57,19 +57,30 @@ function resolveApiKey(provider) {
 }
 
 function aliceResponse(text, endSession = false, history = [], requestBody = {}) {
-  const payload = {
+  const spoken = fitAliceText(text);
+  return {
+    // Modern Alice protocol: response + version (+ optional session_state).
+    // Do not echo `session` — outdated clients accepted it, Dialogs may reject it.
     version: String(requestBody?.version || "1.0"),
     response: {
-      text: fitAliceText(text),
+      text: spoken,
+      tts: spoken,
       end_session: endSession
     },
     session_state: { history }
   };
-  // Older Alice clients still expect session echoed from the request.
-  if (requestBody?.session && typeof requestBody.session === "object") {
-    payload.session = requestBody.session;
-  }
-  return payload;
+}
+
+function summarizeRequest(body, text) {
+  return {
+    sessionNew: Boolean(body?.session?.new),
+    messageId: body?.session?.message_id ?? null,
+    requestType: body?.request?.type || null,
+    command: String(body?.request?.command || "").slice(0, 120),
+    utterance: String(body?.request?.original_utterance || "").slice(0, 120),
+    extractedText: String(text || "").slice(0, 120),
+    hasSessionState: Boolean(body?.state?.session && Object.keys(body.state.session).length)
+  };
 }
 
 function parseRequestBody(req) {
@@ -365,14 +376,21 @@ export default async function handler(req, res) {
     const body = parseRequestBody(req);
     const text = extractUserText(body);
     const oldHistory = safeHistory(body?.state?.session?.history);
+    const requestSummary = summarizeRequest(body, text);
+    console.log("Alice request:", JSON.stringify(requestSummary));
 
     if (!text) {
-      return res.status(200).json(aliceResponse(
+      const payload = aliceResponse(
         "Привет! Я могу ответить на вопрос или найти актуальную информацию. Что хочешь узнать?",
         false,
         oldHistory,
         body
-      ));
+      );
+      console.log("Alice response: greeting", {
+        ms: Date.now() - startedAt,
+        textLen: payload.response.text.length
+      });
+      return res.status(200).json(payload);
     }
 
     try {
@@ -395,12 +413,21 @@ export default async function handler(req, res) {
         { role: "model", text: answer.slice(0, MAX_HISTORY_MESSAGE_CHARS) }
       ].slice(-MAX_HISTORY_MESSAGES);
 
-      return res.status(200).json(aliceResponse(answer, false, history, body));
+      const payload = aliceResponse(answer, false, history, body);
+      console.log("Alice response: llm", {
+        ms: Date.now() - startedAt,
+        textLen: payload.response.text.length,
+        usedSearch: Boolean(searchContext)
+      });
+      return res.status(200).json(payload);
     } catch (error) {
       const safeError = error?.message === "AbortError" || error?.name === "AbortError"
         ? { message: "TIME_BUDGET_EXHAUSTED" }
         : error;
-      console.warn("Alice webhook returned a fallback response:", safeError?.message || "unknown error");
+      console.warn("Alice webhook returned a fallback response:", safeError?.message || "unknown error", {
+        ms: Date.now() - startedAt,
+        ...requestSummary
+      });
       return res.status(200).json(aliceResponse(errorForUser(safeError), false, oldHistory, body));
     }
   } catch (error) {
